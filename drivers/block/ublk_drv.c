@@ -1652,7 +1652,11 @@ static struct io_uring_cmd *__ublk_prep_compl_io_cmd(struct ublk_io *io,
 static void ublk_complete_io_cmd(struct ublk_io *io, struct request *req,
 				 int res, unsigned issue_flags)
 {
-	struct io_uring_cmd *cmd = __ublk_prep_compl_io_cmd(io, req);
+	struct io_uring_cmd *cmd;
+
+	ublk_io_lock(io);
+	cmd = __ublk_prep_compl_io_cmd(io, req);
+	ublk_io_unlock(io);
 
 	/* tell ublksrv one io request is coming */
 	io_uring_cmd_done(cmd, res, issue_flags);
@@ -1688,7 +1692,7 @@ enum auto_buf_reg_res {
  * Setup io state after auto buffer registration.
  *
  * Must be called after ublk_auto_buf_register() is done.
- * Caller must hold io->lock in batch context.
+ * Caller must hold io->lock.
  */
 static void ublk_auto_buf_io_setup(const struct ublk_queue *ubq,
 				   struct request *req, struct ublk_io *io,
@@ -1740,7 +1744,9 @@ static void ublk_auto_buf_dispatch(const struct ublk_queue *ubq,
 			issue_flags);
 
 	if (res != AUTO_BUF_REG_FAIL) {
+		ublk_io_lock(io);
 		ublk_auto_buf_io_setup(ubq, req, io, cmd, res);
+		ublk_io_unlock(io);
 		io_uring_cmd_done(cmd, UBLK_IO_RES_OK, issue_flags);
 	}
 }
@@ -2727,9 +2733,17 @@ static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
 
 	for (i = 0; i < ubq->q_depth; i++) {
 		struct ublk_io *io = &ubq->ios[i];
+		struct request *req;
 
-		if (io->flags & UBLK_IO_FLAG_OWNED_BY_SRV)
-			__ublk_fail_req(ub, io, io->req);
+		ublk_io_lock(io);
+		if (io->flags & UBLK_IO_FLAG_OWNED_BY_SRV) {
+			io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
+			req = io->req;
+			ublk_io_unlock(io);
+			__ublk_fail_req(ub, io, req);
+			continue;
+		}
+		ublk_io_unlock(io);
 	}
 
 	if (ublk_support_batch_io(ubq))
@@ -3466,8 +3480,15 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
 		ret = ublk_check_commit_and_fetch(ub, io, addr);
 		if (ret)
 			goto out;
+		ublk_io_lock(io);
+		if (!(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV)) {
+			ublk_io_unlock(io);
+			ret = -EBUSY;
+			goto out;
+		}
 		io->res = result;
 		req = ublk_fill_io_cmd(io, cmd);
+		ublk_io_unlock(io);
 		ret = ublk_config_io_buf(ub, io, cmd, addr, &buf_idx);
 		if (buf_idx != UBLK_INVALID_BUF_IDX)
 			io_buffer_unregister_bvec(cmd, buf_idx, issue_flags);
@@ -3487,11 +3508,20 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
 		 * uring_cmd active first and prepare for handling new requeued
 		 * request
 		 */
+		ublk_io_lock(io);
+		if (!(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV)) {
+			ublk_io_unlock(io);
+			ret = -EBUSY;
+			goto out;
+		}
 		req = ublk_fill_io_cmd(io, cmd);
+		ublk_io_unlock(io);
 		ret = ublk_config_io_buf(ub, io, cmd, addr, NULL);
 		WARN_ON_ONCE(ret);
 		if (likely(ublk_get_data(ubq, io, req))) {
+			ublk_io_lock(io);
 			__ublk_prep_compl_io_cmd(io, req);
+			ublk_io_unlock(io);
 			return UBLK_IO_RES_OK;
 		}
 		break;
