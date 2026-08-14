@@ -2997,12 +2997,24 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub)
 	__must_hold(&ub->mutex)
 {
 	struct gendisk *disk;
+	int i;
 
 	if (ub->dev_info.state == UBLK_S_DEV_DEAD)
 		return;
 
 	if (ublk_nosrv_dev_should_queue_io(ub))
 		ublk_force_abort_dev(ub);
+
+	ublk_cancel_dev(ub);
+
+	mutex_lock(&ub->cancel_mutex);
+	ublk_set_canceling(ub, true);
+	mutex_unlock(&ub->cancel_mutex);
+
+	for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
+		ublk_abort_queue(ub, ublk_get_queue(ub, i));
+	blk_mq_kick_requeue_list(ub->ub_disk->queue);
+
 	del_gendisk(ub->ub_disk);
 	disk = ublk_detach_disk(ub);
 	put_disk(disk);
@@ -3014,7 +3026,6 @@ static void ublk_stop_dev(struct ublk_device *ub)
 	ublk_stop_dev_unlocked(ub);
 	mutex_unlock(&ub->mutex);
 	cancel_work_sync(&ub->partition_scan_work);
-	ublk_cancel_dev(ub);
 }
 
 static void ublk_reset_io_flags(struct ublk_queue *ubq, struct ublk_io *io)
