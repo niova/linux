@@ -1636,6 +1636,8 @@ static struct io_uring_cmd *__ublk_prep_compl_io_cmd(struct ublk_io *io,
 	/* read cmd first because req will overwrite it */
 	struct io_uring_cmd *cmd = io->cmd;
 
+	lockdep_assert_held(&io->lock);
+
 	/* mark this cmd owned by ublksrv */
 	io->flags |= UBLK_IO_FLAG_OWNED_BY_SRV;
 
@@ -1699,6 +1701,8 @@ static void ublk_auto_buf_io_setup(const struct ublk_queue *ubq,
 				   struct io_uring_cmd *cmd,
 				   enum auto_buf_reg_res res)
 {
+	lockdep_assert_held(&io->lock);
+
 	if (res == AUTO_BUF_REG_OK) {
 		io->task_registered_buffers = 1;
 		io->buf_ctx_handle = io_uring_cmd_ctx_handle(cmd);
@@ -3830,6 +3834,8 @@ static int ublk_batch_commit_io_check(const struct ublk_queue *ubq,
 				      struct ublk_io *io,
 				      union ublk_io_buf *buf)
 {
+	lockdep_assert_held(&io->lock);
+
 	if (!(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV))
 		return -EBUSY;
 
