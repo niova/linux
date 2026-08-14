@@ -361,7 +361,7 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub);
 static bool ublk_try_buf_match(struct ublk_device *ub, struct request *rq,
 				  u32 *buf_idx, u32 *buf_off);
 static void ublk_buf_cleanup(struct ublk_device *ub);
-static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq);
+static unsigned ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq);
 static inline struct request *__ublk_check_and_get_req(struct ublk_device *ub,
 		u16 q_id, u16 tag, struct ublk_io *io);
 static inline unsigned int ublk_req_build_flags(struct request *req);
@@ -2727,8 +2727,9 @@ static void ublk_abort_batch_queue(struct ublk_device *ub,
  * So no one can hold our request IO reference any more, simply ignore the
  * reference, and complete the request immediately
  */
-static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
+static unsigned ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
 {
+	unsigned pending = 0;
 	int i;
 
 	for (i = 0; i < ubq->q_depth; i++) {
@@ -2744,10 +2745,21 @@ static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
 			continue;
 		}
 		ublk_io_unlock(io);
+
+		/*
+		 * A dispatch queued by ublk_queue_cmd() has not published
+		 * OWNED_BY_SRV yet. It is guaranteed to run; leave the tag
+		 * alone and have the caller look again.
+		 */
+		req = blk_mq_tag_to_rq(ub->tag_set.tags[ubq->q_id], i);
+		if (req && blk_mq_request_started(req) && req->tag == i)
+			pending++;
 	}
 
 	if (ublk_support_batch_io(ubq))
 		ublk_abort_batch_queue(ub, ubq);
+
+	return pending;
 }
 
 static void ublk_start_cancel(struct ublk_device *ub)
@@ -3007,10 +3019,15 @@ static struct gendisk *ublk_detach_disk(struct ublk_device *ub)
 	return disk;
 }
 
+#define UBLK_TEARDOWN_INTERVAL_MS	3
+#define UBLK_TEARDOWN_WARN_INTERVAL	msecs_to_jiffies(10000)
+
 static void ublk_stop_dev_unlocked(struct ublk_device *ub)
 	__must_hold(&ub->mutex)
 {
 	struct gendisk *disk;
+	unsigned long warn_interval = UBLK_TEARDOWN_WARN_INTERVAL;
+	unsigned long deadline;
 	int i;
 
 	if (ub->dev_info.state == UBLK_S_DEV_DEAD)
@@ -3019,14 +3036,39 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub)
 	if (ublk_nosrv_dev_should_queue_io(ub))
 		ublk_force_abort_dev(ub);
 
+	blk_mq_quiesce_queue(ub->ub_disk->queue);
+
 	ublk_cancel_dev(ub);
 
 	mutex_lock(&ub->cancel_mutex);
 	ublk_set_canceling(ub, true);
 	mutex_unlock(&ub->cancel_mutex);
 
-	for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
-		ublk_abort_queue(ub, ublk_get_queue(ub, i));
+	/*
+	 * A dispatch handed off to task work between ublk_queue_rq()
+	 * starting the request and ublk_dispatch_req() publishing
+	 * OWNED_BY_SRV is invisible to a single ublk_abort_queue() pass.
+	 * Keep retrying until nothing is left pending; every such dispatch
+	 * is guaranteed to run, so this always terminates.
+	 */
+	deadline = jiffies + warn_interval;
+	for (;;) {
+		unsigned pending = 0;
+
+		for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
+			pending += ublk_abort_queue(ub, ublk_get_queue(ub, i));
+		if (!pending)
+			break;
+		if (time_after(jiffies, deadline)) {
+			pr_warn("%s: dev %d stop stuck on %u pending dispatch(es)\n",
+				__func__, ub->dev_info.dev_id, pending);
+			warn_interval *= 2;
+			deadline = jiffies + warn_interval;
+		}
+		msleep(UBLK_TEARDOWN_INTERVAL_MS);
+	}
+
+	blk_mq_unquiesce_queue(ub->ub_disk->queue);
 	blk_mq_kick_requeue_list(ub->ub_disk->queue);
 
 	del_gendisk(ub->ub_disk);
