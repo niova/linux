@@ -736,9 +736,11 @@ static void ublk_clear_dispatching(struct ublk_io *io)
 	ublk_io_lock(io);
 	/*
 	 * Callers reach this both from a dispatch and from a request that was
-	 * never marked, so only the former is a state change.
+	 * never marked, so only the former is a state change.  The flag cannot
+	 * tell them apart: it stays set across the task work hop, where the
+	 * state is UBLK_IO_S_TW_PENDING and has to survive.
 	 */
-	if (io->flags & UBLK_IO_FLAG_DISPATCHING)
+	if (io->state == UBLK_IO_S_DISPATCHING)
 		ublk_io_moved(io, UBLK_IO_S_AVAILABLE);
 	io->flags &= ~UBLK_IO_FLAG_DISPATCHING;
 	ublk_io_unlock(io);
