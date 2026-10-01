@@ -19,10 +19,13 @@ TEST_PROGS += test_generic_12.sh
 TEST_PROGS += test_generic_13.sh
 TEST_PROGS += test_generic_16.sh
 TEST_PROGS += test_generic_17.sh
+TEST_PROGS += test_generic_zc_ubsan.sh
+TEST_PROGS += test_generic_shmem_rcu.sh
 
 TEST_PROGS += test_batch_01.sh
 TEST_PROGS += test_batch_02.sh
 TEST_PROGS += test_batch_03.sh
+TEST_PROGS += test_batch_04.sh
 
 TEST_PROGS += test_null_01.sh
 TEST_PROGS += test_null_02.sh
@@ -34,6 +37,7 @@ TEST_PROGS += test_loop_04.sh
 TEST_PROGS += test_loop_05.sh
 TEST_PROGS += test_loop_06.sh
 TEST_PROGS += test_loop_07.sh
+TEST_PROGS += test_loop_08.sh
 
 TEST_PROGS += test_integrity_01.sh
 TEST_PROGS += test_integrity_02.sh
@@ -53,6 +57,8 @@ TEST_PROGS += test_stripe_06.sh
 TEST_PROGS += test_part_01.sh
 TEST_PROGS += test_part_02.sh
 
+TEST_PROGS += test_params_01.sh
+
 TEST_PROGS += test_shmemzc_01.sh
 TEST_PROGS += test_shmemzc_02.sh
 TEST_PROGS += test_shmemzc_03.sh
@@ -67,6 +73,29 @@ TEST_PROGS += test_stress_06.sh
 TEST_PROGS += test_stress_07.sh
 TEST_PROGS += test_stress_08.sh
 TEST_PROGS += test_stress_09.sh
+
+TEST_PROGS += test_teardown_debugfs_tags.sh
+TEST_PROGS += test_teardown_debugfs_record.sh
+TEST_PROGS += test_teardown_kill_recover.sh
+TEST_PROGS += test_teardown_cancel_race.sh
+TEST_PROGS += test_teardown_user_copy.sh
+TEST_PROGS += test_teardown_quiesce_repark.sh
+TEST_PROGS += test_teardown_get_data.sh
+TEST_PROGS += test_teardown_force_abort.sh
+TEST_PROGS += test_teardown_quiesce_abandoned.sh
+TEST_PROGS += test_teardown_quiesce_dispatch.sh
+TEST_PROGS += test_teardown_refuse_handover.sh
+TEST_PROGS += test_teardown_batch_fifo.sh
+TEST_PROGS += test_teardown_quiesce_batch.sh
+TEST_PROGS += test_teardown_srv_owned.sh
+TEST_PROGS += test_teardown_batch_cancel_tw.sh
+TEST_PROGS += test_teardown_stop_owned.sh
+TEST_PROGS += test_teardown_abandon_ring.sh
+TEST_PROGS += test_teardown_self_del.sh
+TEST_PROGS += test_teardown_union_split.sh
+TEST_PROGS += test_teardown_add_during_del.sh
+TEST_PROGS += test_teardown_clean_shutdown.sh
+TEST_PROGS += test_teardown_end_recovery.sh
 
 TEST_FILES := settings
 

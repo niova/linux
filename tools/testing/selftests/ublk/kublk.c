@@ -8,6 +8,13 @@
 #include "kublk.h"
 
 #define MAX_NR_TGT_ARG 	64
+#define KUBLK_PARAM_LOGICAL_BS_SHIFT		9
+#define KUBLK_PARAM_PHYSICAL_BS_SHIFT		12
+#define KUBLK_PARAM_ZONE_SECTORS		128
+#define KUBLK_PARAM_NR_ZONES			16
+#define KUBLK_PARAM_DEV_SECTORS			\
+	(KUBLK_PARAM_ZONE_SECTORS * KUBLK_PARAM_NR_ZONES)
+#define KUBLK_PARAM_ZONE_APPEND_SECTORS		8
 
 unsigned int ublk_dbg_mask = UBLK_LOG;
 static const struct ublk_tgt_ops *tgt_ops_list[] = {
@@ -227,6 +234,55 @@ static int ublk_ctrl_get_features(struct ublk_dev *dev,
 	return __ublk_ctrl_cmd(dev, &data);
 }
 
+static int parse_param_types(const char *arg, __u32 *types)
+{
+	char buf[128], *save = NULL, *tok;
+
+	if (strlen(arg) >= sizeof(buf))
+		return -EINVAL;
+
+	strcpy(buf, arg);
+	*types = 0;
+	tok = strtok_r(buf, ",", &save);
+	while (tok) {
+		if (!strcmp(tok, "none"))
+			;
+		else if (!strcmp(tok, "basic"))
+			*types |= UBLK_PARAM_TYPE_BASIC;
+		else if (!strcmp(tok, "zoned"))
+			*types |= UBLK_PARAM_TYPE_ZONED;
+		else
+			return -EINVAL;
+		tok = strtok_r(NULL, ",", &save);
+	}
+
+	return 0;
+}
+
+static void ublk_init_params_from_ctx(const struct dev_ctx *ctx,
+				      struct ublk_params *params)
+{
+	const struct params_ctx *p = &ctx->params;
+
+	*params = (struct ublk_params) {
+		.types = p->types,
+		.basic = {
+			.logical_bs_shift	= p->logical_bs_shift,
+			.physical_bs_shift	= p->physical_bs_shift,
+			.io_min_shift		= p->io_min_shift,
+			.io_opt_shift		= p->io_opt_shift,
+			.max_sectors		= p->max_sectors,
+			.chunk_sectors		= p->chunk_sectors,
+			.dev_sectors		= p->dev_sectors,
+		},
+		.zoned = {
+			.max_open_zones		= p->max_open_zones,
+			.max_active_zones	= p->max_active_zones,
+			.max_zone_append_sectors = p->max_zone_append_sectors,
+		},
+	};
+}
+
 static int ublk_ctrl_update_size(struct ublk_dev *dev,
 		__u64 nr_sects)
 {
@@ -352,6 +408,8 @@ static void ublk_ctrl_dump(struct ublk_dev *dev)
 	ublk_log("\tmax rq size %d daemon pid %d flags 0x%llx state %s\n",
 			info->max_io_buf_bytes, info->ublksrv_pid, info->flags,
 			ublk_dev_state_desc(dev));
+	if (info->flags & UBLK_F_IO_DESC_SIZE)
+		ublk_log("\tio_desc_size %u\n", info->io_desc_size);
 
 	if (affinity) {
 		char buf[512];
@@ -400,22 +458,22 @@ static struct ublk_dev *ublk_ctrl_init(void)
 	return dev;
 }
 
-static int __ublk_queue_cmd_buf_sz(unsigned depth)
+static size_t __ublk_queue_cmd_buf_sz(const struct ublk_queue *q, __u16 depth)
 {
-	int size =  depth * sizeof(struct ublksrv_io_desc);
-	unsigned int page_sz = getpagesize();
+	size_t size = depth * (size_t)q->io_desc_size;
+	size_t page_sz = getpagesize();
 
 	return round_up(size, page_sz);
 }
 
-static int ublk_queue_max_cmd_buf_sz(void)
+static size_t ublk_queue_max_cmd_buf_sz(const struct ublk_queue *q)
 {
-	return __ublk_queue_cmd_buf_sz(UBLK_MAX_QUEUE_DEPTH);
+	return __ublk_queue_cmd_buf_sz(q, UBLK_MAX_QUEUE_DEPTH);
 }
 
-static int ublk_queue_cmd_buf_sz(struct ublk_queue *q)
+static size_t ublk_queue_cmd_buf_sz(const struct ublk_queue *q)
 {
-	return __ublk_queue_cmd_buf_sz(q->q_depth);
+	return __ublk_queue_cmd_buf_sz(q, q->q_depth);
 }
 
 static void ublk_queue_deinit(struct ublk_queue *q)
@@ -453,7 +511,7 @@ static int ublk_queue_init(struct ublk_queue *q, unsigned long long extra_flags,
 	struct ublk_dev *dev = q->dev;
 	int depth = dev->dev_info.queue_depth;
 	int i;
-	int cmd_buf_size, io_buf_size, integrity_size;
+	size_t cmd_buf_size, io_buf_size, integrity_size;
 	unsigned long off;
 
 	pthread_spin_init(&q->lock, PTHREAD_PROCESS_PRIVATE);
@@ -463,12 +521,13 @@ static int ublk_queue_init(struct ublk_queue *q, unsigned long long extra_flags,
 	q->flags = dev->dev_info.flags;
 	q->flags |= extra_flags;
 	q->metadata_size = metadata_size;
+	q->io_desc_size = dev->dev_info.io_desc_size;
 
 	/* Cache fd in queue for fast path access */
 	q->ublk_fd = dev->fds[0];
 
 	cmd_buf_size = ublk_queue_cmd_buf_sz(q);
-	off = UBLKSRV_CMD_BUF_OFFSET + q->q_id * ublk_queue_max_cmd_buf_sz();
+	off = UBLKSRV_CMD_BUF_OFFSET + q->q_id * ublk_queue_max_cmd_buf_sz(q);
 	q->io_cmd_buf = mmap(0, cmd_buf_size, PROT_READ,
 			MAP_SHARED | MAP_POPULATE, dev->fds[0], off);
 	if (q->io_cmd_buf == MAP_FAILED) {
@@ -540,9 +599,14 @@ static int ublk_thread_init(struct ublk_thread *t, unsigned long long extra_flag
 		unsigned max_nr_ios_per_thread = nr_ios / dev->nthreads;
 		max_nr_ios_per_thread += !!(nr_ios % dev->nthreads);
 
+		t->auto_buf_stride = max_nr_ios_per_thread;
 		t->nr_bufs = max_nr_ios_per_thread;
+		if ((extra_flags & UBLKS_Q_ROTATE_AUTO_BUF) &&
+		    (dev->dev_info.flags & UBLK_F_AUTO_BUF_REG))
+			t->nr_bufs *= 2;
 	} else {
 		t->nr_bufs = 0;
+		t->auto_buf_stride = 0;
 	}
 
 	if (ublk_dev_batch_io(dev))
@@ -863,7 +927,11 @@ static void ublk_handle_uring_cmd(struct ublk_thread *t,
 		if (ublk_queue_use_user_copy(q))
 			ublk_user_copy(io, UBLK_IO_OP_WRITE);
 
-		if (q->tgt_ops->queue_io)
+		/*
+		 * --hold_io: never complete what we fetched, so the tag stays
+		 * UBLK_IO_FLAG_OWNED_BY_SRV and teardown has to deal with it
+		 */
+		if (q->tgt_ops->queue_io && !t->dev->hold_io)
 			q->tgt_ops->queue_io(t, q, tag);
 	} else if (cqe->res == UBLK_IO_RES_NEED_GET_DATA) {
 		io->flags |= UBLKS_IO_NEED_GET_DATA | UBLKS_IO_FREE;
@@ -996,6 +1064,87 @@ static void ublk_batch_setup_queues(struct ublk_thread *t)
 	}
 }
 
+/*
+ * Server-initiated teardown. Neither ordering a real ublk server picks is
+ * reachable otherwise: the IO threads only leave ublk_process_io() once the
+ * driver has cancelled the commands parked in their rings, so every stop
+ * arrives from an external 'ublk del'.
+ *
+ * UBLK_TEARDOWN_CLEAN sends STOP_DEV and lets the driver cancel, so the
+ * rings go only after the queues drained. UBLK_TEARDOWN_ABANDON_RING leaves
+ * the rings straight away, while the device is still live and no STOP_DEV
+ * was ever sent, which leaves the driver with the rings gone but
+ * /dev/ublkcN still open.
+ *
+ * Both run on a sigwait() thread rather than a handler, because
+ * ublk_ctrl_stop_dev() submits on the control ring and is not
+ * async-signal-safe.
+ */
+enum ublk_teardown_mode {
+	UBLK_TEARDOWN_NONE,
+	UBLK_TEARDOWN_CLEAN,
+	UBLK_TEARDOWN_ABANDON_RING,
+	UBLK_TEARDOWN_SELF_DEL,
+};
+
+static struct {
+	volatile sig_atomic_t	abandon;
+	enum ublk_teardown_mode	mode;
+	struct ublk_dev		*dev;
+	struct ublk_thread_info	*tinfo;
+	unsigned		nthreads;
+} ublk_teardown;
+
+static enum ublk_teardown_mode ublk_teardown_mode_of(const struct dev_ctx *ctx)
+{
+	if (ctx->clean_teardown)
+		return UBLK_TEARDOWN_CLEAN;
+	if (ctx->self_del)
+		return UBLK_TEARDOWN_SELF_DEL;
+	if (ctx->abandon_ring)
+		return UBLK_TEARDOWN_ABANDON_RING;
+	return UBLK_TEARDOWN_NONE;
+}
+
+/* only needed to break io_uring_submit_and_wait() out of its wait */
+static void ublk_teardown_wakeup(int sig)
+{
+}
+
+static void *ublk_teardown_fn(void *data)
+{
+	sigset_t set;
+	unsigned i;
+	int sig;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+
+	if (sigwait(&set, &sig))
+		return NULL;
+
+	if (ublk_teardown.mode == UBLK_TEARDOWN_CLEAN) {
+		ublk_ctrl_stop_dev(ublk_teardown.dev);
+		return NULL;
+	}
+
+	/*
+	 * Deleting our own device: every command parked in our rings is a
+	 * reference on the ublkc file, and they only go when we exit, which
+	 * we cannot do until this returns.
+	 */
+	if (ublk_teardown.mode == UBLK_TEARDOWN_SELF_DEL) {
+		ublk_ctrl_del_dev(ublk_teardown.dev);
+		return NULL;
+	}
+
+	ublk_teardown.abandon = 1;
+	for (i = 0; i < ublk_teardown.nthreads; i++)
+		pthread_kill(ublk_teardown.tinfo[i].thread, SIGUSR1);
+	return NULL;
+}
+
 static __attribute__((noinline)) int __ublk_io_handler_fn(struct ublk_thread_info *info)
 {
 	struct ublk_thread t = {
@@ -1029,6 +1178,9 @@ static __attribute__((noinline)) int __ublk_io_handler_fn(struct ublk_thread_inf
 	}
 
 	do {
+		/* leave without draining, so the ring goes while IO is live */
+		if (ublk_teardown.abandon)
+			break;
 		if (ublk_process_io(&t) < 0)
 			break;
 	} while (1);
@@ -1402,8 +1554,10 @@ static int ublk_start_daemon(const struct dev_ctx *ctx, struct ublk_dev *dev)
 	cpu_set_t *affinity_buf;
 	unsigned char (*q_thread_map)[UBLK_MAX_QUEUES] = NULL;
 	uint64_t stop_val = 1;
-	pthread_t listener;
+	pthread_t listener, teardown;
+	bool teardown_started = false;
 	void *thread_ret;
+	sigset_t set;
 	sem_t ready;
 	int ret, i;
 
@@ -1412,6 +1566,25 @@ static int ublk_start_daemon(const struct dev_ctx *ctx, struct ublk_dev *dev)
 	tinfo = calloc(sizeof(struct ublk_thread_info), dev->nthreads);
 	if (!tinfo)
 		return -ENOMEM;
+
+	ublk_teardown.mode = ublk_teardown_mode_of(ctx);
+	if (ublk_teardown.mode != UBLK_TEARDOWN_NONE) {
+		/*
+		 * Block the two signals before any IO thread exists, so they
+		 * inherit the mask and only the sigwait() thread sees them.
+		 * SIGUSR1 stays deliverable: it is what breaks an IO thread
+		 * out of io_uring_submit_and_wait().
+		 */
+		sigemptyset(&set);
+		sigaddset(&set, SIGINT);
+		sigaddset(&set, SIGTERM);
+		pthread_sigmask(SIG_BLOCK, &set, NULL);
+		signal(SIGUSR1, ublk_teardown_wakeup);
+
+		ublk_teardown.dev = dev;
+		ublk_teardown.tinfo = tinfo;
+		ublk_teardown.nthreads = dev->nthreads;
+	}
 
 	sem_init(&ready, 0, 0);
 	ret = ublk_dev_prep(ctx, dev);
@@ -1436,6 +1609,8 @@ static int ublk_start_daemon(const struct dev_ctx *ctx, struct ublk_dev *dev)
 		extra_flags = UBLKS_Q_AUTO_BUF_REG_FALLBACK;
 	if (ctx->no_ublk_fixed_fd)
 		extra_flags |= UBLKS_Q_NO_UBLK_FIXED_FD;
+	if (ctx->rotate_auto_buf)
+		extra_flags |= UBLKS_Q_ROTATE_AUTO_BUF;
 
 	for (i = 0; i < dinfo->nr_hw_queues; i++) {
 		dev->q[i].dev = dev;
@@ -1505,6 +1680,11 @@ static int ublk_start_daemon(const struct dev_ctx *ctx, struct ublk_dev *dev)
 		ublk_ctrl_dump(dev);
 	else
 		ublk_send_dev_event(ctx, dev, dev->dev_info.dev_id);
+
+	/* only once the device is live is there anything to tear down */
+	if (ublk_teardown.mode != UBLK_TEARDOWN_NONE)
+		teardown_started = !pthread_create(&teardown, NULL,
+						   ublk_teardown_fn, NULL);
 fail_start:
 	/*
 	 * Wait for I/O threads to exit. While waiting, a listener
@@ -1529,6 +1709,21 @@ fail_start:
 		ublk_shmem_sock_destroy(dinfo->dev_id, linfo.sock_fd);
 	}
 	ublk_shmem_unregister_all();
+
+	if (teardown_started)
+		pthread_join(teardown, NULL);
+
+	/*
+	 * The rings are gone but /dev/ublkcN is not: closing it here would
+	 * turn this into the ordinary exit the other modes take. Stay until
+	 * something outside kills us.
+	 */
+	if (ublk_teardown.abandon) {
+		free(tinfo);
+		while (1)
+			pause();
+	}
+
 	free(tinfo);
  fail:
 	for (i = 0; i < dinfo->nr_hw_queues; i++)
@@ -1708,12 +1903,15 @@ static int __cmd_dev_add(const struct dev_ctx *ctx)
 	info->dev_id = ctx->dev_id;
 	info->nr_hw_queues = nr_queues;
 	info->queue_depth = depth;
+	info->io_desc_size = ctx->io_desc_size;
 	info->flags = ctx->flags;
 	if ((features & UBLK_F_QUIESCE) &&
 			(info->flags & UBLK_F_USER_RECOVERY))
 		info->flags |= UBLK_F_QUIESCE;
 	dev->nthreads = nthreads;
 	dev->per_io_tasks = ctx->per_io_tasks;
+	dev->bad_buf_index = ctx->bad_buf_index;
+	dev->hold_io = ctx->hold_io;
 	dev->tgt.ops = ops;
 	dev->tgt.sq_depth = depth;
 	dev->tgt.cq_depth = depth;
@@ -1760,6 +1958,51 @@ fail:
 }
 
 static int __cmd_dev_list(struct dev_ctx *ctx);
+
+static int cmd_dev_set_params(struct dev_ctx *ctx)
+{
+	struct ublksrv_ctrl_dev_info *info;
+	struct ublk_params params;
+	struct ublk_dev *dev;
+	__u64 features;
+	int ret, del_ret;
+
+	dev = ublk_ctrl_init();
+	if (!dev)
+		return -ENODEV;
+
+	ret = ublk_ctrl_get_features(dev, &features);
+	if (ret < 0)
+		goto out;
+
+	if (!(features & UBLK_F_CMD_IOCTL_ENCODE)) {
+		ret = -ENOTSUP;
+		goto out;
+	}
+
+	info = &dev->dev_info;
+	info->dev_id = ctx->dev_id;
+	info->nr_hw_queues = ctx->nr_hw_queues;
+	info->queue_depth = ctx->queue_depth;
+	info->io_desc_size = ctx->io_desc_size;
+	info->flags = ctx->flags;
+
+	ret = ublk_ctrl_add_dev(dev);
+	if (ret < 0)
+		goto out;
+
+	ublk_init_params_from_ctx(ctx, &params);
+
+	ret = ublk_ctrl_set_params(dev, &params);
+	printf("SET_PARAMS returned %d\n", ret);
+
+	del_ret = ublk_ctrl_del_dev(dev);
+	if (del_ret < 0 && ret == 0)
+		ret = del_ret;
+out:
+	ublk_ctrl_deinit(dev);
+	return ret < 0 ? ret : 0;
+}
 
 static int cmd_dev_add(struct dev_ctx *ctx)
 {
@@ -1970,6 +2213,7 @@ static int cmd_dev_get_features(void)
 		FEAT_NAME(UBLK_F_BATCH_IO),
 		FEAT_NAME(UBLK_F_NO_AUTO_PART_SCAN),
 		FEAT_NAME(UBLK_F_SHMEM_ZC),
+		FEAT_NAME(UBLK_F_IO_DESC_SIZE),
 	};
 	struct ublk_dev *dev;
 	__u64 features = 0;
@@ -2067,7 +2311,13 @@ static void __cmd_create_help(char *exe, bool recovery)
 	printf("\t[--nthreads threads] [--per_io_tasks]\n");
 	printf("\t[--integrity_capable] [--integrity_reftag] [--metadata_size SIZE] "
 		 "[--pi_offset OFFSET] [--csum_type ip|t10dif|nvme] [--tag_size SIZE]\n");
-	printf("\t[--batch|-b] [--no_auto_part_scan]\n");
+	printf("\t[--batch|-b] [--rotate_auto_buf] [--no_auto_part_scan]\n");
+	printf("\t[--bad_buf_index] fail auto buffer registration where no fallback was asked for\n");
+	printf("\t[--io_desc_size SIZE]\n");
+	printf("\t[--clean_teardown] stop the device on SIGINT/SIGTERM and let the driver cancel\n");
+	printf("\t[--abandon_ring] leave the rings on SIGINT/SIGTERM without stopping the device\n");
+	printf("\t[--self_del] delete our own device on SIGINT/SIGTERM\n");
+	printf("\t[--hold_io] never complete a fetched request, leaving the tag owned by the server\n");
 	printf("\t[target options] [backfile1] [backfile2] ...\n");
 	printf("\tdefault: nr_queues=2(max 32), depth=128(max 1024), dev_id=-1(auto allocation)\n");
 	printf("\tdefault: nthreads=nr_queues");
@@ -2104,6 +2354,9 @@ static int cmd_dev_help(char *exe)
 	printf("\t --safe only stop if device has no active openers\n\n");
 	printf("%s list [-n dev_id] -a \n", exe);
 	printf("\t -a list all devices, -n list specified device, default -a \n\n");
+	printf("%s set_params [-n dev_id] [-q nr_queues] [-d depth] [-u] [--zoned]\n", exe);
+	printf("\t[--param_types basic[,zoned]|none]\n");
+	printf("\t issue ADD_DEV, SET_PARAMS and DEL_DEV without START_DEV\n\n");
 	printf("%s features\n", exe);
 	printf("%s update_size -n dev_id -s|--size size_in_bytes \n", exe);
 	printf("%s quiesce -n dev_id\n", exe);
@@ -2141,10 +2394,29 @@ int main(int argc, char *argv[])
 		{ "tag_size",		1,	NULL,  0 },
 		{ "safe",		0,	NULL,  0 },
 		{ "batch",              0,      NULL, 'b'},
+		{ "rotate_auto_buf",	0,	NULL,  0 },
+		{ "clean_teardown",	0,	NULL,  0 },
+		{ "abandon_ring",	0,	NULL,  0 },
+		{ "self_del",		0,	NULL,  0 },
+		{ "hold_io",		0,	NULL,  0 },
 		{ "no_auto_part_scan",	0,	NULL,  0 },
 		{ "shmem_zc",		0,	NULL,  0  },
 		{ "htlb",		1,	NULL,  0  },
 		{ "rdonly_shmem_buf",	0,	NULL,  0  },
+		{ "bad_buf_index",	0,	NULL,  0  },
+		{ "io_desc_size",	1,	NULL,  0  },
+		{ "zoned",		0,	NULL,  0  },
+		{ "param_types",	1,	NULL,  0  },
+		{ "logical_bs_shift",	1,	NULL,  0  },
+		{ "physical_bs_shift",	1,	NULL,  0  },
+		{ "io_min_shift",	1,	NULL,  0  },
+		{ "io_opt_shift",	1,	NULL,  0  },
+		{ "max_sectors",	1,	NULL,  0  },
+		{ "chunk_sectors",	1,	NULL,  0  },
+		{ "dev_sectors",	1,	NULL,  0  },
+		{ "max_zone_append_sectors", 1, NULL,  0  },
+		{ "max_open_zones",	1,	NULL,  0  },
+		{ "max_active_zones",	1,	NULL,  0  },
 		{ 0, 0, 0, 0 }
 	};
 	const struct ublk_tgt_ops *ops = NULL;
@@ -2157,6 +2429,20 @@ int main(int argc, char *argv[])
 		.dev_id		=	-1,
 		.tgt_type	=	"unknown",
 		.csum_type	=	LBMD_PI_CSUM_NONE,
+		.io_desc_size	=	sizeof(struct ublksrv_io_desc),
+		.params = {
+			.types			= UBLK_PARAM_TYPE_BASIC,
+			.logical_bs_shift	= KUBLK_PARAM_LOGICAL_BS_SHIFT,
+			.physical_bs_shift	= KUBLK_PARAM_PHYSICAL_BS_SHIFT,
+			.io_min_shift		= KUBLK_PARAM_LOGICAL_BS_SHIFT,
+			.io_opt_shift		= KUBLK_PARAM_PHYSICAL_BS_SHIFT,
+			.max_sectors		=
+				UBLK_IO_MAX_BYTES >> KUBLK_PARAM_LOGICAL_BS_SHIFT,
+			.chunk_sectors		= KUBLK_PARAM_ZONE_SECTORS,
+			.dev_sectors		= KUBLK_PARAM_DEV_SECTORS,
+			.max_zone_append_sectors =
+				KUBLK_PARAM_ZONE_APPEND_SECTORS,
+		},
 	};
 	int ret = -EINVAL, i;
 	int tgt_argc = 1;
@@ -2228,6 +2514,8 @@ int main(int argc, char *argv[])
 				ctx.flags |= UBLK_F_AUTO_BUF_REG;
 			if (!strcmp(longopts[option_idx].name, "auto_zc_fallback"))
 				ctx.auto_zc_fallback = 1;
+			if (!strcmp(longopts[option_idx].name, "rotate_auto_buf"))
+				ctx.rotate_auto_buf = 1;
 			if (!strcmp(longopts[option_idx].name, "nthreads"))
 				ctx.nthreads = strtol(optarg, NULL, 10);
 			if (!strcmp(longopts[option_idx].name, "per_io_tasks"))
@@ -2260,12 +2548,54 @@ int main(int argc, char *argv[])
 				ctx.safe_stop = 1;
 			if (!strcmp(longopts[option_idx].name, "no_auto_part_scan"))
 				ctx.flags |= UBLK_F_NO_AUTO_PART_SCAN;
+			if (!strcmp(longopts[option_idx].name, "clean_teardown"))
+				ctx.clean_teardown = 1;
+			if (!strcmp(longopts[option_idx].name, "abandon_ring"))
+				ctx.abandon_ring = 1;
+			if (!strcmp(longopts[option_idx].name, "self_del"))
+				ctx.self_del = 1;
+			if (!strcmp(longopts[option_idx].name, "hold_io"))
+				ctx.hold_io = 1;
 			if (!strcmp(longopts[option_idx].name, "shmem_zc"))
 				ctx.flags |= UBLK_F_SHMEM_ZC;
 			if (!strcmp(longopts[option_idx].name, "htlb"))
 				ctx.htlb_path = strdup(optarg);
 			if (!strcmp(longopts[option_idx].name, "rdonly_shmem_buf"))
 				ctx.rdonly_shmem_buf = 1;
+			if (!strcmp(longopts[option_idx].name, "bad_buf_index"))
+				ctx.bad_buf_index = 1;
+			if (!strcmp(longopts[option_idx].name, "io_desc_size")) {
+				ctx.flags |= UBLK_F_IO_DESC_SIZE;
+				ctx.io_desc_size = strtoul(optarg, NULL, 0);
+			}
+			if (!strcmp(longopts[option_idx].name, "zoned"))
+				ctx.flags |= UBLK_F_ZONED;
+			if (!strcmp(longopts[option_idx].name, "param_types")) {
+				ret = parse_param_types(optarg, &ctx.params.types);
+				if (ret)
+					return ret;
+			}
+			if (!strcmp(longopts[option_idx].name, "logical_bs_shift"))
+				ctx.params.logical_bs_shift = strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "physical_bs_shift"))
+				ctx.params.physical_bs_shift = strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "io_min_shift"))
+				ctx.params.io_min_shift = strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "io_opt_shift"))
+				ctx.params.io_opt_shift = strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "max_sectors"))
+				ctx.params.max_sectors = strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "chunk_sectors"))
+				ctx.params.chunk_sectors = strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "dev_sectors"))
+				ctx.params.dev_sectors = strtoull(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "max_zone_append_sectors"))
+				ctx.params.max_zone_append_sectors =
+					strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "max_open_zones"))
+				ctx.params.max_open_zones = strtoul(optarg, NULL, 0);
+			if (!strcmp(longopts[option_idx].name, "max_active_zones"))
+				ctx.params.max_active_zones = strtoul(optarg, NULL, 0);
 			break;
 		case '?':
 			/*
@@ -2335,6 +2665,13 @@ int main(int argc, char *argv[])
 		return -EINVAL;
 	}
 
+	if (ctx.rotate_auto_buf &&
+	    !((ctx.flags & UBLK_F_AUTO_BUF_REG) &&
+	      (ctx.flags & UBLK_F_BATCH_IO))) {
+		ublk_err("rotate_auto_buf requires --auto_zc and --batch\n");
+		return -EINVAL;
+	}
+
 	i = optind;
 	while (i < argc && ctx.nr_files < MAX_BACK_FILES) {
 		ctx.files[ctx.nr_files++] = argv[i++];
@@ -2348,7 +2685,9 @@ int main(int argc, char *argv[])
 		ops->parse_cmd_line(&ctx, tgt_argc, tgt_argv);
 	}
 
-	if (!strcmp(cmd, "add"))
+	if (!strcmp(cmd, "set_params"))
+		ret = cmd_dev_set_params(&ctx);
+	else if (!strcmp(cmd, "add"))
 		ret = cmd_dev_add(&ctx);
 	else if (!strcmp(cmd, "recover")) {
 		if (ctx.dev_id < 0) {

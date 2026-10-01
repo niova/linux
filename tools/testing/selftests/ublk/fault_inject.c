@@ -11,8 +11,10 @@
 #include "kublk.h"
 
 struct fi_opts {
-	long long delay_ns;
+	/* io_uring reads this at submit, so it cannot live on the caller's stack */
+	struct __kernel_timespec delay_ts;
 	bool die_during_fetch;
+	unsigned long die_during_fetch_delay_us;
 };
 
 static int ublk_fault_inject_tgt_init(const struct dev_ctx *ctx,
@@ -47,8 +49,11 @@ static int ublk_fault_inject_tgt_init(const struct dev_ctx *ctx,
 		return -ENOMEM;
 	}
 
-	opts->delay_ns = ctx->fault_inject.delay_us * 1000;
+	opts->delay_ts.tv_sec = ctx->fault_inject.delay_us / 1000000;
+	opts->delay_ts.tv_nsec = (ctx->fault_inject.delay_us % 1000000) * 1000;
 	opts->die_during_fetch = ctx->fault_inject.die_during_fetch;
+	opts->die_during_fetch_delay_us =
+		ctx->fault_inject.die_during_fetch_delay_us;
 	dev->private_data = opts;
 
 	return 0;
@@ -75,6 +80,13 @@ static void ublk_fault_inject_pre_fetch_io(struct ublk_thread *t,
 		 * before we die.
 		 */
 		io_uring_submit(&t->ring);
+		/*
+		 * Hold the kill back to lose the race against the main thread's
+		 * END_USER_RECOVERY, which is otherwise almost never issued in
+		 * time to be waiting in the kernel when the server dies.
+		 */
+		if (opts->die_during_fetch_delay_us)
+			usleep(opts->die_during_fetch_delay_us);
 		raise(SIGKILL);
 	}
 }
@@ -85,12 +97,9 @@ static int ublk_fault_inject_queue_io(struct ublk_thread *t,
 	const struct ublksrv_io_desc *iod = ublk_get_iod(q, tag);
 	struct io_uring_sqe *sqe;
 	struct fi_opts *opts = q->dev->private_data;
-	struct __kernel_timespec ts = {
-		.tv_nsec = opts->delay_ns,
-	};
 
 	ublk_io_alloc_sqes(t, &sqe, 1);
-	io_uring_prep_timeout(sqe, &ts, 1, 0);
+	io_uring_prep_timeout(sqe, &opts->delay_ts, 1, 0);
 	sqe->user_data = build_user_data(tag, ublksrv_get_op(iod), 0, q->q_id, 1);
 
 	ublk_queued_tgt_io(t, q, tag, 1);
@@ -119,12 +128,14 @@ static void ublk_fault_inject_cmd_line(struct dev_ctx *ctx, int argc, char *argv
 	static const struct option longopts[] = {
 		{ "delay_us", 	1,	NULL,  0  },
 		{ "die_during_fetch", 1, NULL, 0  },
+		{ "die_during_fetch_delay_us", 1, NULL, 0 },
 		{ 0, 0, 0, 0 }
 	};
 	int option_idx, opt;
 
 	ctx->fault_inject.delay_us = 0;
 	ctx->fault_inject.die_during_fetch = false;
+	ctx->fault_inject.die_during_fetch_delay_us = 0;
 	while ((opt = getopt_long(argc, argv, "",
 				  longopts, &option_idx)) != -1) {
 		switch (opt) {
@@ -133,13 +144,15 @@ static void ublk_fault_inject_cmd_line(struct dev_ctx *ctx, int argc, char *argv
 				ctx->fault_inject.delay_us = strtoll(optarg, NULL, 10);
 			if (!strcmp(longopts[option_idx].name, "die_during_fetch"))
 				ctx->fault_inject.die_during_fetch = strtoll(optarg, NULL, 10);
+			if (!strcmp(longopts[option_idx].name, "die_during_fetch_delay_us"))
+				ctx->fault_inject.die_during_fetch_delay_us = strtoll(optarg, NULL, 10);
 		}
 	}
 }
 
 static void ublk_fault_inject_usage(const struct ublk_tgt_ops *ops)
 {
-	printf("\tfault_inject: [--delay_us us (default 0)] [--die_during_fetch 1]\n");
+	printf("\tfault_inject: [--delay_us us (default 0)] [--die_during_fetch 1] [--die_during_fetch_delay_us us (default 0)]\n");
 }
 
 const struct ublk_tgt_ops fault_inject_tgt_ops = {
