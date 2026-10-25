@@ -3877,8 +3877,6 @@ static void ublk_wait_tagset_rqs_idle(struct ublk_device *ub)
 	}
 }
 
-#define UBLK_FREEZE_WARN_TIMEOUT_MS	5000
-
 #ifdef CONFIG_DEBUG_FS
 static const char *ublk_tag_evt_name(u8 id);
 static const char *ublk_park_op_name(u8 op);
@@ -3920,43 +3918,6 @@ static void ublk_td_dump_evts(const struct ublk_device *ub, struct ublk_io *io,
 static void ublk_td_dump_evts(const struct ublk_device *ub,
 			      struct ublk_io *io, u16 tag) { }
 #endif
-
-static bool ublk_warn_started_rq(struct request *rq, void *data)
-{
-	struct ublk_device *ub = data;
-	struct ublk_queue *ubq = rq->mq_hctx->driver_data;
-	struct ublk_io *io = &ubq->ios[rq->tag];
-
-	pr_warn("%s: dev %d qid %d tag %d still started: io_flags %x ref %u task_bufs %u task %d\n",
-			__func__, ub->dev_info.dev_id, ubq->q_id, rq->tag,
-			io->flags, refcount_read(&io->ref),
-			io->task_registered_buffers,
-			io->task ? task_pid_nr(io->task) : -1);
-	ublk_td_dump_evts(ub, io, rq->tag);
-	return true;
-}
-
-/*
- * del_gendisk() waits forever for a request teardown failed to dispose of,
- * with nothing naming the tag. Report those tags before entering that wait.
- */
-static void ublk_warn_started_rqs(struct ublk_device *ub)
-{
-	unsigned int elapsed;
-	bool idle;
-
-	for (elapsed = 0; elapsed < UBLK_FREEZE_WARN_TIMEOUT_MS;
-	     elapsed += UBLK_REQUEUE_DELAY_MS) {
-		idle = true;
-		blk_mq_tagset_busy_iter(&ub->tag_set,
-				ublk_check_inflight_rq, &idle);
-		if (idle)
-			return;
-		msleep(UBLK_REQUEUE_DELAY_MS);
-	}
-
-	blk_mq_tagset_busy_iter(&ub->tag_set, ublk_warn_started_rq, ub);
-}
 
 static void ublk_force_abort_dev(struct ublk_device *ub)
 {
@@ -4005,11 +3966,11 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub)
 	if (ublk_nosrv_dev_should_queue_io(ub))
 		ublk_force_abort_dev(ub);
 
-	/* del_gendisk() waits for these, so get rid of them first */
-	ublk_abort_dev(ub);
-	blk_mq_kick_requeue_list(ub->ub_disk->queue);
-
-	ublk_warn_started_rqs(ub);
+	/*
+	 * A live server serves the writeback del_gendisk() issues and the
+	 * requests it already holds. If it never returns them, del_gendisk()
+	 * waits until it exits and the release path aborts them.
+	 */
 	del_gendisk(ub->ub_disk);
 	disk = ublk_detach_disk(ub);
 	put_disk(disk);
